@@ -49,7 +49,6 @@
 #include "auth/Auth.h"
 #include "auth/KeyRing.h"
 #include "auth/AuthClientHandler.h"
-#include "auth/AuthMethodList.h"
 #include "auth/AuthRegistry.h"
 #include "auth/RotatingKeyRing.h"
 
@@ -1431,6 +1430,15 @@ int MonClient::handle_auth_request(
   const ceph::buffer::list& payload,
   ceph::buffer::list *reply)
 {
+  if (payload.length() == 0) {
+    // for some channels prior to nautilus (osd heartbeat), we
+    // tolerate the lack of an authorizer.
+    if (!con->get_messenger()->require_authorizer) {
+      handle_authentication_dispatcher->ms_handle_authentication(con);
+      return 1;
+    }
+    return -EACCES;
+  }
   auth_meta->auth_mode = payload[0];
   if (auth_meta->auth_mode < AUTH_MODE_AUTHORIZER ||
       auth_meta->auth_mode > AUTH_MODE_AUTHORIZER_MAX) {
@@ -1446,7 +1454,7 @@ int MonClient::handle_auth_request(
   bool was_challenge = (bool)auth_meta->authorizer_challenge;
   bool isvalid = ah->verify_authorizer(
     cct,
-    rotating_secrets.get(),
+    *rotating_secrets,
     payload,
     auth_meta->get_connection_secret_length(),
     reply,
@@ -1465,6 +1473,8 @@ int MonClient::handle_auth_request(
     return 0;
   }
   ldout(cct,10) << __func__ << " bad authorizer on " << con << dendl;
+  // discard old challenge
+  auth_meta->authorizer_challenge.reset();
   return -EACCES;
 }
 

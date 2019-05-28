@@ -152,8 +152,14 @@ AsyncConnection::~AsyncConnection()
   ceph_assert(!delay_state);
 }
 
-int AsyncConnection::get_con_mode() const {
+int AsyncConnection::get_con_mode() const
+{
   return protocol->get_con_mode();
+}
+
+bool AsyncConnection::is_msgr2() const
+{
+  return protocol->proto_type == 2;
 }
 
 void AsyncConnection::maybe_start_delay_thread()
@@ -449,6 +455,8 @@ void AsyncConnection::process() {
           read_buffer = nullptr;
           readCallback(buf_tmp, r);
         }
+	logger->tinc(l_msgr_running_recv_time,
+	    ceph::mono_clock::now() - recv_start_time);
         return;
       }
       break;
@@ -749,7 +757,7 @@ void AsyncConnection::tick(uint64_t id)
     if (connect_timeout_us <=
         (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>
           (now - last_connect_started).count()) {
-      ldout(async_msgr->cct, 0) << __func__ << " see no progress in more than "
+      ldout(async_msgr->cct, 1) << __func__ << " see no progress in more than "
                                 << connect_timeout_us
                                 << " us during connecting, fault."
                                 << dendl;

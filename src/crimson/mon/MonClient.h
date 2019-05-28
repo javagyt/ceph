@@ -13,8 +13,8 @@
 #include "auth/KeyRing.h"
 #include "common/ceph_context.h"
 
+#include "crimson/auth/AuthClient.h"
 #include "crimson/auth/AuthServer.h"
-#include "crimson/common/auth_service.h"
 #include "crimson/common/auth_handler.h"
 #include "crimson/net/Dispatcher.h"
 #include "crimson/net/Fwd.h"
@@ -29,7 +29,6 @@ namespace ceph::net {
 }
 
 struct AuthAuthorizeHandler;
-class AuthMethodList;
 class MAuthReply;
 struct MMonMap;
 struct MMonSubscribeAck;
@@ -43,12 +42,11 @@ namespace ceph::mon {
 class Connection;
 
 class Client : public ceph::net::Dispatcher,
-	       public ceph::common::AuthService,
+	       public ceph::auth::AuthClient,
 	       public ceph::auth::AuthServer
 {
   EntityName entity_name;
   KeyRing keyring;
-  std::unique_ptr<AuthMethodList> auth_methods;
   const uint32_t want_keys;
 
   MonMap monmap;
@@ -92,8 +90,6 @@ public:
   void sub_unwant(const std::string& what);
   bool sub_want_increment(const std::string& what, version_t start, unsigned flags);
   seastar::future<> renew_subs();
-  // AuthService methods
-  AuthAuthorizer* get_authorizer(peer_type_t peer) const override;
 
 private:
   // AuthServer methods
@@ -115,17 +111,41 @@ private:
   AuthRegistry auth_registry;
   ceph::common::AuthHandler& auth_handler;
 
+  // AuthClient methods
+  ceph::auth::AuthClient::auth_request_t
+  get_auth_request(ceph::net::ConnectionRef conn,
+		   AuthConnectionMetaRef auth_meta) final;
+
+   // Handle server's request to continue the handshake
+  ceph::bufferlist handle_auth_reply_more(ceph::net::ConnectionRef conn,
+					  AuthConnectionMetaRef auth_meta,
+					  const bufferlist& bl) final;
+
+   // Handle server's indication that authentication succeeded
+  int handle_auth_done(ceph::net::ConnectionRef conn,
+		       AuthConnectionMetaRef auth_meta,
+		       uint64_t global_id,
+		       uint32_t con_mode,
+		       const bufferlist& bl) final;
+
+   // Handle server's indication that the previous auth attempt failed
+  int handle_auth_bad_method(ceph::net::ConnectionRef conn,
+			     AuthConnectionMetaRef auth_meta,
+			     uint32_t old_auth_method,
+			     int result,
+			     const std::vector<uint32_t>& allowed_methods,
+			     const std::vector<uint32_t>& allowed_modes) final;
+
 private:
   void tick();
 
-  seastar::future<> ms_dispatch(ceph::net::ConnectionRef conn,
+  seastar::future<> ms_dispatch(ceph::net::Connection* conn,
 				MessageRef m) override;
   seastar::future<> ms_handle_reset(ceph::net::ConnectionRef conn) override;
-  AuthAuthorizer* ms_get_authorizer(peer_type_t peer) const override;
 
-  seastar::future<> handle_monmap(ceph::net::ConnectionRef conn,
+  seastar::future<> handle_monmap(ceph::net::Connection* conn,
 				  Ref<MMonMap> m);
-  seastar::future<> handle_auth_reply(ceph::net::ConnectionRef conn,
+  seastar::future<> handle_auth_reply(ceph::net::Connection* conn,
 				      Ref<MAuthReply> m);
   seastar::future<> handle_subscribe_ack(Ref<MMonSubscribeAck> m);
   seastar::future<> handle_get_version_reply(Ref<MMonGetVersionReply> m);

@@ -24,17 +24,19 @@
  *   disks, disk groups, total # osds,
  *
  */
-#include "include/types.h"
-#include "osd_types.h"
-
-//#include "include/ceph_features.h"
-#include "crush/CrushWrapper.h"
 #include <vector>
 #include <list>
 #include <set>
 #include <map>
 #include <memory>
+
 #include "include/btree_map.h"
+#include "include/types.h"
+#include "common/ceph_releases.h"
+#include "osd_types.h"
+
+//#include "include/ceph_features.h"
+#include "crush/CrushWrapper.h"
 
 // forward declaration
 class CephContext;
@@ -362,7 +364,7 @@ public:
     utime_t modified;
     int64_t new_pool_max; //incremented by the OSDMonitor on each pool create
     int32_t new_flags;
-    int8_t new_require_osd_release = -1;
+    ceph_release_t new_require_osd_release{0xff};
 
     // full (rare)
     ceph::buffer::list fullmap;  // in lieu of below.
@@ -399,13 +401,15 @@ public:
     mempool::osdmap::map<int64_t, snap_interval_set_t> new_removed_snaps;
     mempool::osdmap::map<int64_t, snap_interval_set_t> new_purged_snaps;
 
+    mempool::osdmap::map<int32_t,uint32_t> new_crush_node_flags;
+
     std::string cluster_snapshot;
 
     float new_nearfull_ratio = -1;
     float new_backfillfull_ratio = -1;
     float new_full_ratio = -1;
 
-    int8_t new_require_min_compat_client = -1;
+    ceph_release_t new_require_min_compat_client{0xff};
 
     utime_t new_last_up_change, new_last_in_change;
 
@@ -511,6 +515,8 @@ private:
   int32_t max_osd;
   std::vector<uint32_t> osd_state;
 
+  mempool::osdmap::map<int32_t,uint32_t> crush_node_flags; // crush node -> CEPH_OSD_* flags
+
   utime_t last_up_change, last_in_change;
 
   // These features affect OSDMap[::Incremental] encoding, or the
@@ -576,11 +582,11 @@ private:
   float full_ratio = 0, backfillfull_ratio = 0, nearfull_ratio = 0;
 
   /// min compat client we want to support
-  uint8_t require_min_compat_client = 0;  // CEPH_RELEASE_*
+  ceph_release_t require_min_compat_client{ceph_release_t::unknown};
 
 public:
   /// require osds to run at least this release
-  uint8_t require_osd_release = 0;    // CEPH_RELEASE_*
+  ceph_release_t require_osd_release{ceph_release_t::unknown};
 
 private:
   mutable uint64_t cached_up_osd_features;
@@ -709,7 +715,7 @@ public:
 
   void get_all_osds(std::set<int32_t>& ls) const;
   void get_up_osds(std::set<int32_t>& ls) const;
-  void get_out_osds(std::set<int32_t>& ls) const;
+  void get_out_existing_osds(std::set<int32_t>& ls) const;
   unsigned get_num_pg_temp() const {
     return pg_temp->size();
   }
@@ -815,6 +821,11 @@ public:
     return !is_up(osd);
   }
 
+  bool is_stop(int osd) const {
+    return exists(osd) && is_down(osd) &&
+           (osd_state[osd] & CEPH_OSD_STOP);
+  }
+
   bool is_out(int osd) const {
     return !exists(osd) || get_weight(osd) == CEPH_OSD_OUT;
   }
@@ -822,6 +833,8 @@ public:
   bool is_in(int osd) const {
     return !is_out(osd);
   }
+
+  unsigned get_crush_node_flags(int osd) const;
 
   bool is_noup(int osd) const {
     return exists(osd) && (osd_state[osd] & CEPH_OSD_NOUP);
@@ -1000,12 +1013,12 @@ public:
    * get oldest *client* version (firefly, hammer, etc.) that can connect given
    * the feature bits required (according to get_features()).
    */
-  uint8_t get_min_compat_client() const;
+  ceph_release_t get_min_compat_client() const;
 
   /**
    * gets the required minimum *client* version that can connect to the cluster.
    */
-  uint8_t get_require_min_compat_client() const;
+  ceph_release_t get_require_min_compat_client() const;
 
   /**
    * get intersection of features supported by up osds
@@ -1388,6 +1401,14 @@ public:
   bool have_pg_upmaps(pg_t pg) const {
     return pg_upmap.count(pg) ||
       pg_upmap_items.count(pg);
+  }
+
+  bool check_full(const set<pg_shard_t> &missing_on) const {
+    for (auto shard : missing_on) {
+      if (get_state(shard.osd) & CEPH_OSD_FULL)
+	return true;
+    }
+    return false;
   }
 
   /*

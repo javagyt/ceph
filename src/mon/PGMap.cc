@@ -172,7 +172,7 @@ void PGMapDigest::dump(ceph::Formatter *f) const
     f->dump_unsigned("osd", p.first);
     f->dump_unsigned("num_primary_pg", p.second.primary);
     f->dump_unsigned("num_acting_pg", p.second.acting);
-    f->dump_unsigned("num_up_pg", p.second.up);
+    f->dump_unsigned("num_up_not_acting_pg", p.second.up_not_acting);
     f->close_section();
   }
   f->close_section();
@@ -1305,8 +1305,11 @@ void PGMap::stat_pg_add(const pg_t &pgid, const pg_stat_t &s,
     num_pg_by_osd[*p].acting++;
   }
   for (auto p = s.up.begin(); p != s.up.end(); ++p) {
-    pg_by_osd[*p].insert(pgid);
-    num_pg_by_osd[*p].up++;
+    auto& t = pg_by_osd[*p];
+    if (t.find(pgid) == t.end()) {
+      t.insert(pgid);
+      num_pg_by_osd[*p].up_not_acting++;
+    }
   }
 
   if (s.up_primary >= 0) {
@@ -1366,7 +1369,9 @@ bool PGMap::stat_pg_sub(const pg_t &pgid, const pg_stat_t &s,
       blocked_by_sum.erase(q);
   }
 
+  set<int32_t> actingset;
   for (auto p = s.acting.begin(); p != s.acting.end(); ++p) {
+    actingset.insert(*p);
     auto& oset = pg_by_osd[*p];
     oset.erase(pgid);
     if (oset.empty())
@@ -1380,9 +1385,11 @@ bool PGMap::stat_pg_sub(const pg_t &pgid, const pg_stat_t &s,
     oset.erase(pgid);
     if (oset.empty())
       pg_by_osd.erase(*p);
+    if (actingset.count(*p))
+      continue;
     auto it = num_pg_by_osd.find(*p);
-    if (it != num_pg_by_osd.end() && it->second.up > 0)
-      it->second.up--;
+    if (it != num_pg_by_osd.end() && it->second.up_not_acting > 0)
+      it->second.up_not_acting--;
   }
 
   if (s.up_primary >= 0) {
@@ -2875,7 +2882,7 @@ void PGMap::get_health_checks(
   // REQUEST_SLOW
   // REQUEST_STUCK
   // SLOW_OPS unifies them in mimic.
-  if (osdmap.require_osd_release < CEPH_RELEASE_MIMIC &&
+  if (osdmap.require_osd_release < ceph_release_t::mimic &&
       cct->_conf->mon_osd_warn_op_age > 0 &&
       !osd_sum.op_queue_age_hist.h.empty() &&
       osd_sum.op_queue_age_hist.upper_bound() / 1000.0 >
@@ -3003,6 +3010,10 @@ void PGMap::get_health_checks(
 	summary = "BlueFS spillover detected";
       } else if (asum.first == "BLUESTORE_NO_COMPRESSION") {
 	summary = "BlueStore compression broken";
+      } else if (asum.first == "BLUESTORE_LEGACY_STATFS") {
+	summary = "Legacy BlueStore stats reporting detected";
+      } else if (asum.first == "BLUESTORE_DISK_SIZE_MISMATCH") {
+	summary = "BlueStore has dangerous mismatch between block device and free list sizes";
       }
       summary += " on ";
       summary += stringify(asum.second.first);

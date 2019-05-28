@@ -4,7 +4,12 @@
 #include "ProtocolV2.h"
 
 #include <seastar/core/lowres_clock.hh>
-
+#include <fmt/format.h>
+#if __has_include(<fmt/chrono.h>)
+#include <fmt/chrono.h>
+#else
+#include <fmt/time.h>
+#endif
 #include "include/msgr.h"
 #include "include/random.h"
 
@@ -56,6 +61,36 @@ inline seastar::future<> unexpected_tag(const Tag& unexpected,
 }
 
 } // namespace anonymous
+
+namespace fmt {
+template <>
+struct formatter<seastar::lowres_system_clock::time_point> {
+  // ignore the format string
+  template <typename ParseContext>
+  constexpr auto parse(ParseContext &ctx) { return ctx.begin(); }
+
+  template <typename FormatContext>
+  auto format(const seastar::lowres_system_clock::time_point& t,
+	      FormatContext& ctx) {
+    struct tm bdt;
+    time_t tt = std::chrono::duration_cast<std::chrono::seconds>(
+      t.time_since_epoch()).count();
+    localtime_r(&tt, &bdt);
+    auto milliseconds = (t.time_since_epoch() %
+			 std::chrono::seconds(1)).count();
+    return format_to(ctx.out(), "{:%Y-%m-%d %H:%M:%S} {:03d}",
+		     bdt, milliseconds);
+  }
+};
+}
+
+namespace std {
+inline ostream& operator<<(
+  ostream& out, const seastar::lowres_system_clock::time_point& t)
+{
+  return out << fmt::format("{}", t);
+}
+}
 
 namespace ceph::net {
 
@@ -481,14 +516,9 @@ seastar::future<> ProtocolV2::handle_auth_reply()
           logger().debug("{} auth reply more len={}",
                          conn, auth_more.auth_payload().length());
           ceph_assert(messenger.get_auth_client());
-          ceph::bufferlist reply;
-          int r = messenger.get_auth_client()->handle_auth_reply_more(
-               conn.shared_from_this(), auth_meta, auth_more.auth_payload(), &reply);
-          if (r < 0) {
-            logger().error("{} auth_client handle_auth_reply_more returned {}",
-                           conn, r);
-            abort_in_fault();
-          }
+          // let execute_connecting() take care of the thrown exception
+          auto reply = messenger.get_auth_client()->handle_auth_reply_more(
+            conn.shared_from_this(), auth_meta, auth_more.auth_payload());
           auto more_reply = AuthRequestMoreFrame::Encode(reply);
           return write_frame(more_reply);
         }).then([this] {
@@ -503,9 +533,7 @@ seastar::future<> ProtocolV2::handle_auth_reply()
               conn.shared_from_this(), auth_meta,
               auth_done.global_id(),
               auth_done.con_mode(),
-              auth_done.auth_payload(),
-              &auth_meta->session_key,
-              &auth_meta->connection_secret);
+              auth_done.auth_payload());
           if (r < 0) {
             logger().error("{} auth_client handle_auth_done returned {}", conn, r);
             abort_in_fault();
@@ -528,21 +556,20 @@ seastar::future<> ProtocolV2::client_auth(std::vector<uint32_t> &allowed_methods
   // send_auth_request() logic
   ceph_assert(messenger.get_auth_client());
 
-  bufferlist bl;
-  vector<uint32_t> preferred_modes;
-  int r = messenger.get_auth_client()->get_auth_request(
-      conn.shared_from_this(), auth_meta, &auth_meta->auth_method,
-      &preferred_modes, &bl);
-  if (r < 0) {
-    logger().error("{} get_initial_auth_request returned {}", conn, r);
+  try {
+    auto [auth_method, preferred_modes, bl] =
+      messenger.get_auth_client()->get_auth_request(conn.shared_from_this(), auth_meta);
+    auth_meta->auth_method = auth_method;
+    auto frame = AuthRequestFrame::Encode(auth_method, preferred_modes, bl);
+    return write_frame(frame).then([this] {
+      return handle_auth_reply();
+    });
+  } catch (const ceph::auth::error& e) {
+    logger().error("{} get_initial_auth_request returned {}", conn, e);
     dispatch_reset();
     abort_in_close();
+    return seastar::now();
   }
-
-  auto frame = AuthRequestFrame::Encode(auth_meta->auth_method, preferred_modes, bl);
-  return write_frame(frame).then([this] {
-    return handle_auth_reply();
-  });
 }
 
 seastar::future<bool> ProtocolV2::process_wait()
@@ -764,6 +791,13 @@ void ProtocolV2::execute_connecting()
                            conn, conn.peer_type, (int)_peer_type);
             dispatch_reset();
             abort_in_close();
+          }
+          if (messenger.get_myaddrs().empty() ||
+              messenger.get_myaddrs().front().is_blank_ip()) {
+            logger().debug("peer {} says I am {}", conn.target_addr, _peer_addr);
+            return messenger.learned_addr(_peer_addr);
+          } else {
+            return seastar::now();
           }
         }).then([this] {
           return client_auth();
@@ -1308,46 +1342,54 @@ seastar::future<> ProtocolV2::send_reconnect_ok()
 
 // READY state
 
-seastar::future<> ProtocolV2::write_message(MessageRef msg)
+ceph::bufferlist ProtocolV2::do_sweep_messages(
+    const std::deque<MessageRef>& msgs,
+    size_t num_msgs,
+    bool require_keepalive,
+    std::optional<utime_t> _keepalive_ack)
 {
-  // TODO: move to common code
-  // set priority
-  msg->get_header().src = messenger.get_myname();
+  ceph::bufferlist bl;
 
-  msg->encode(conn.features, 0);
+  if (unlikely(require_keepalive)) {
+    auto keepalive_frame = KeepAliveFrame::Encode();
+    bl.append(keepalive_frame.get_buffer(session_stream_handlers));
+  }
 
-  msg->set_seq(++conn.out_seq);
-  uint64_t ack_seq = conn.in_seq;
-  // ack_left = 0;
+  if (unlikely(_keepalive_ack.has_value())) {
+    auto keepalive_ack_frame = KeepAliveFrameAck::Encode(*_keepalive_ack);
+    bl.append(keepalive_ack_frame.get_buffer(session_stream_handlers));
+  }
 
-  ceph_msg_header &header = msg->get_header();
-  ceph_msg_footer &footer = msg->get_footer();
+  std::for_each(msgs.begin(), msgs.begin()+num_msgs, [this, &bl](const MessageRef& msg) {
+    // TODO: move to common code
+    // set priority
+    msg->get_header().src = messenger.get_myname();
 
-  ceph_msg_header2 header2{header.seq,        header.tid,
-                           header.type,       header.priority,
-                           header.version,
-                           0,                 header.data_off,
-                           ack_seq,
-                           footer.flags,      header.compat_version,
-                           header.reserved};
+    msg->encode(conn.features, 0);
 
-  auto message = MessageFrame::Encode(header2,
-      msg->get_payload(), msg->get_middle(), msg->get_data());
-  logger().debug("{} write msg type={} off={} seq={}",
-                 conn, header2.type, header2.data_off, header2.seq);
-  return write_frame(message, false);
-}
+    msg->set_seq(++conn.out_seq);
+    uint64_t ack_seq = conn.in_seq;
+    // ack_left = 0;
 
-seastar::future<> ProtocolV2::do_keepalive()
-{
-  auto keepalive_frame = KeepAliveFrame::Encode();
-  return write_frame(keepalive_frame, false);
-}
+    ceph_msg_header &header = msg->get_header();
+    ceph_msg_footer &footer = msg->get_footer();
 
-seastar::future<> ProtocolV2::do_keepalive_ack()
-{
-  auto keepalive_ack_frame = KeepAliveFrameAck::Encode(last_keepalive_ack_to_send);
-  return write_frame(keepalive_ack_frame, false);
+    ceph_msg_header2 header2{header.seq,        header.tid,
+                             header.type,       header.priority,
+                             header.version,
+                             0,                 header.data_off,
+                             ack_seq,
+                             footer.flags,      header.compat_version,
+                             header.reserved};
+
+    auto message = MessageFrame::Encode(header2,
+        msg->get_payload(), msg->get_middle(), msg->get_data());
+    logger().debug("{} write msg type={} off={} seq={}",
+                   conn, header2.type, header2.data_off, header2.seq);
+    bl.append(message.get_buffer(session_stream_handlers));
+  });
+
+  return bl;
 }
 
 void ProtocolV2::handle_message_ack(seq_num_t seq) {
@@ -1442,11 +1484,8 @@ seastar::future<> ProtocolV2::read_message(utime_t throttle_stamp)
     // TODO: change MessageRef with seastar::shared_ptr
     auto msg_ref = MessageRef{message, false};
     seastar::with_gate(pending_dispatch, [this, msg = std::move(msg_ref)] {
-      return dispatcher.ms_dispatch(
-          seastar::static_pointer_cast<SocketConnection>(
-            conn.shared_from_this()),
-          std::move(msg))
-      .handle_exception([this] (std::exception_ptr eptr) {
+      return dispatcher.ms_dispatch(&conn, std::move(msg))
+	.handle_exception([this] (std::exception_ptr eptr) {
         logger().error("{} ms_dispatch caught exception: {}", conn, eptr);
         ceph_assert(false);
       });
@@ -1501,17 +1540,15 @@ void ProtocolV2::execute_ready()
             return read_frame_payload().then([this] {
               // handle_keepalive2() logic
               auto keepalive_frame = KeepAliveFrame::Decode(rx_segments_data.back());
-              last_keepalive_ack_to_send = keepalive_frame.timestamp();
-              logger().debug("{} got KEEPALIVE2 {}",
-                             conn, last_keepalive_ack_to_send);
-              conn.last_keepalive = utime_t{seastar::lowres_system_clock::now()};
-              notify_keepalive_ack();
+              notify_keepalive_ack(keepalive_frame.timestamp());
+              conn.set_last_keepalive(seastar::lowres_system_clock::now());
             });
           case Tag::KEEPALIVE2_ACK:
             return read_frame_payload().then([this] {
               // handle_keepalive2_ack() logic
               auto keepalive_ack_frame = KeepAliveFrameAck::Decode(rx_segments_data.back());
-              conn.last_keepalive_ack = keepalive_ack_frame.timestamp();
+              conn.set_last_keepalive_ack(
+                seastar::lowres_system_clock::time_point{keepalive_ack_frame.timestamp()});
               logger().debug("{} got KEEPALIVE_ACK {}",
                              conn, conn.last_keepalive_ack);
             });

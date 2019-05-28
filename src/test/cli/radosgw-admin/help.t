@@ -17,7 +17,8 @@
     subuser rm                 remove subuser
     key create                 create access key
     key rm                     remove access key
-    bucket list                list buckets
+    bucket list                list buckets (specify --allow-unordered for
+                               faster, unsorted listing)
     bucket limit check         show bucket sharding stats
     bucket link                link bucket to specified user
     bucket unlink              unlink bucket from specified user
@@ -38,6 +39,8 @@
     object unlink              unlink object from bucket index
     object rewrite             rewrite the specified object
     objects expire             run expired objects cleanup
+    objects expire-stale list  list stale expired objects (caused by reshard)
+    objects expire-stale rm    remove stale expired objects
     period rm                  remove a period
     period get                 get period info
     period get-current         get current period info
@@ -254,6 +257,7 @@
      --infile=<file>           specify a file to read in when setting data
      --categories=<list>       comma separated list of categories, used in usage show
      --caps=<caps>             list of caps (e.g., "usage=read, write; user=read")
+     --op-mask=<op-mask>       permission of user's operations (e.g., "read, write, delete, *")
      --yes-i-really-mean-it    required for certain operations
      --warnings-only           when specified with bucket limit check, list
                                only buckets nearing or over the current max

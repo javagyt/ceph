@@ -128,7 +128,7 @@ static seastar::future<> run(
       seastar::future<> stop() {
         return seastar::make_ready_future<>();
       }
-      seastar::future<> ms_dispatch(ceph::net::ConnectionRef c,
+      seastar::future<> ms_dispatch(ceph::net::Connection* c,
                                     MessageRef m) override {
         ceph_assert(m->get_type() == CEPH_MSG_OSD_OP);
 
@@ -224,7 +224,7 @@ static seastar::future<> run(
         active_session->connected_time = mono_clock::now();
         return seastar::now();
       }
-      seastar::future<> ms_dispatch(ceph::net::ConnectionRef c,
+      seastar::future<> ms_dispatch(ceph::net::Connection* c,
                                     MessageRef m) override {
         // server replies with MOSDOp to generate server-side write workload
         ceph_assert(m->get_type() == CEPH_MSG_OSD_OP);
@@ -253,6 +253,7 @@ static seastar::future<> run(
             .then([&client] (ceph::net::Messenger *messenger) {
               client.msgr = messenger;
               client.msgr->set_default_policy(ceph::net::SocketPolicy::lossy_client(0));
+              client.msgr->set_require_authorizer(false);
               client.msgr->set_auth_client(&client.dummy_auth);
               client.msgr->set_auth_server(&client.dummy_auth);
               return client.msgr->start(&client);

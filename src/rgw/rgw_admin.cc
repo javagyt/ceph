@@ -44,7 +44,9 @@ extern "C" {
 #include "rgw_usage.h"
 #include "rgw_orphan.h"
 #include "rgw_sync.h"
-#include "rgw_sync_log_trim.h"
+#include "rgw_trim_bilog.h"
+#include "rgw_trim_datalog.h"
+#include "rgw_trim_mdlog.h"
 #include "rgw_data_sync.h"
 #include "rgw_rest_conn.h"
 #include "rgw_realm_watcher.h"
@@ -95,7 +97,8 @@ void usage()
   cout << "  subuser rm                 remove subuser\n";
   cout << "  key create                 create access key\n";
   cout << "  key rm                     remove access key\n";
-  cout << "  bucket list                list buckets\n";
+  cout << "  bucket list                list buckets (specify --allow-unordered for\n";
+  cout << "                             faster, unsorted listing)\n";
   cout << "  bucket limit check         show bucket sharding stats\n";
   cout << "  bucket link                link bucket to specified user\n";
   cout << "  bucket unlink              unlink bucket from specified user\n";
@@ -116,6 +119,8 @@ void usage()
   cout << "  object unlink              unlink object from bucket index\n";
   cout << "  object rewrite             rewrite the specified object\n";
   cout << "  objects expire             run expired objects cleanup\n";
+  cout << "  objects expire-stale list  list stale expired objects (caused by reshard)\n";
+  cout << "  objects expire-stale rm    remove stale expired objects\n";
   cout << "  period rm                  remove a period\n";
   cout << "  period get                 get period info\n";
   cout << "  period get-current         get current period info\n";
@@ -332,6 +337,7 @@ void usage()
   cout << "   --infile=<file>           specify a file to read in when setting data\n";
   cout << "   --categories=<list>       comma separated list of categories, used in usage show\n";
   cout << "   --caps=<caps>             list of caps (e.g., \"usage=read, write; user=read\")\n";
+  cout << "   --op-mask=<op-mask>       permission of user's operations (e.g., \"read, write, delete, *\")\n";
   cout << "   --yes-i-really-mean-it    required for certain operations\n";
   cout << "   --warnings-only           when specified with bucket limit check, list\n";
   cout << "                             only buckets nearing or over the current max\n";
@@ -423,6 +429,8 @@ enum {
   OPT_OBJECT_STAT,
   OPT_OBJECT_REWRITE,
   OPT_OBJECTS_EXPIRE,
+  OPT_OBJECTS_EXPIRE_STALE_LIST,
+  OPT_OBJECTS_EXPIRE_STALE_RM,
   OPT_BI_GET,
   OPT_BI_PUT,
   OPT_BI_LIST,
@@ -567,6 +575,7 @@ static int get_cmd(const char *cmd, const char *prev_cmd, const char *prev_prev_
       strcmp(cmd, "datalog") == 0 ||
       strcmp(cmd, "error") == 0 ||
       strcmp(cmd, "event") == 0 ||
+      strcmp(cmd, "expire-stale") == 0 ||
       strcmp(cmd, "gc") == 0 ||
       strcmp(cmd, "global") == 0 ||
       strcmp(cmd, "key") == 0 ||
@@ -744,6 +753,12 @@ static int get_cmd(const char *cmd, const char *prev_cmd, const char *prev_prev_
   } else if (strcmp(prev_cmd, "objects") == 0) {
     if (strcmp(cmd, "expire") == 0)
       return OPT_OBJECTS_EXPIRE;
+  } else if ((prev_prev_cmd && strcmp(prev_prev_cmd, "objects") == 0) &&
+	     (strcmp(prev_cmd, "expire-stale") == 0)) {
+    if (strcmp(cmd, "list") == 0)
+      return OPT_OBJECTS_EXPIRE_STALE_LIST;
+    if (strcmp(cmd, "rm") == 0)
+      return OPT_OBJECTS_EXPIRE_STALE_RM;
   } else if (strcmp(prev_cmd, "olh") == 0) {
     if (strcmp(cmd, "get") == 0)
       return OPT_OLH_GET;
@@ -2818,6 +2833,7 @@ int main(int argc, const char **argv)
   bool have_max_objects = false;
   bool have_max_size = false;
   int include_all = false;
+  int allow_unordered = false;
 
   int sync_stats = false;
   int reset_stats = false;
@@ -3061,6 +3077,8 @@ int main(int argc, const char **argv)
     } else if (ceph_argparse_binary_flag(args, i, &reset_stats, NULL, "--reset-stats", (char*)NULL)) {
       // do nothing
     } else if (ceph_argparse_binary_flag(args, i, &include_all, NULL, "--include-all", (char*)NULL)) {
+     // do nothing
+    } else if (ceph_argparse_binary_flag(args, i, &allow_unordered, NULL, "--allow-unordered", (char*)NULL)) {
      // do nothing
     } else if (ceph_argparse_binary_flag(args, i, &extra_info, NULL, "--extra-info", (char*)NULL)) {
      // do nothing
@@ -5454,6 +5472,7 @@ int main(int argc, const char **argv)
       list_op.params.ns = ns;
       list_op.params.enforce_ns = false;
       list_op.params.list_versions = true;
+      list_op.params.allow_unordered = bool(allow_unordered);
 
       do {
         ret = list_op.list_objects(max_entries - count, &result, &common_prefixes, &truncated);
@@ -6015,7 +6034,7 @@ next:
     }
 
     map<string, bufferlist> attrs;
-    ret = obj->put(bl, attrs);
+    ret = obj->put(bl, attrs, dpp());
     if (ret < 0) {
       cerr << "ERROR: put object returned error: " << cpp_strerror(-ret) << std::endl;
     }
@@ -6064,7 +6083,7 @@ next:
       }
     }
     if (need_rewrite) {
-      ret = store->rewrite_obj(bucket_info, obj);
+      ret = store->rewrite_obj(bucket_info, obj, dpp());
       if (ret < 0) {
         cerr << "ERROR: object rewrite returned: " << cpp_strerror(-ret) << std::endl;
         return -ret;
@@ -6078,6 +6097,22 @@ next:
     if (!store->process_expire_objects()) {
       cerr << "ERROR: process_expire_objects() processing returned error." << std::endl;
       return 1;
+    }
+  }
+
+  if (opt_cmd == OPT_OBJECTS_EXPIRE_STALE_LIST) {
+    ret = RGWBucketAdminOp::fix_obj_expiry(store, bucket_op, f, true);
+    if (ret < 0) {
+      cerr << "ERROR: listing returned " << cpp_strerror(-ret) << std::endl;
+      return -ret;
+    }
+  }
+
+  if (opt_cmd == OPT_OBJECTS_EXPIRE_STALE_RM) {
+    ret = RGWBucketAdminOp::fix_obj_expiry(store, bucket_op, f, false);
+    if (ret < 0) {
+      cerr << "ERROR: removing returned " << cpp_strerror(-ret) << std::endl;
+      return -ret;
     }
   }
 
@@ -6165,7 +6200,7 @@ next:
           if (!need_rewrite) {
             formatter->dump_string("status", "Skipped");
           } else {
-            r = store->rewrite_obj(bucket_info, obj);
+            r = store->rewrite_obj(bucket_info, obj, dpp());
             if (r == 0) {
               formatter->dump_string("status", "Success");
             } else {
@@ -6432,6 +6467,8 @@ next:
         handled = dump_string("etag", bl, formatter);
       } else if (iter->first == RGW_ATTR_COMPRESSION) {
         handled = decode_dump<RGWCompressionInfo>("compression", bl, formatter);
+      } else if (iter->first == RGW_ATTR_DELETE_AT) {
+        handled = decode_dump<utime_t>("delete_at", bl, formatter);
       }
 
       if (!handled)

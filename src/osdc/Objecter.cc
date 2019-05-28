@@ -2982,7 +2982,7 @@ int Objecter::_calc_target(op_target_t *t, Connection *con, bool any_change)
     return RECALC_OP_TARGET_NEED_RESEND;
   }
   if (split_or_merge &&
-      (osdmap->require_osd_release >= CEPH_RELEASE_LUMINOUS ||
+      (osdmap->require_osd_release >= ceph_release_t::luminous ||
        HAVE_FEATURE(osdmap->get_xinfo(acting_primary).features,
 		    RESEND_ON_SPLIT))) {
     return RECALC_OP_TARGET_NEED_RESEND;
@@ -4456,17 +4456,6 @@ bool Objecter::ms_handle_refused(Connection *con)
     }
   }
   return false;
-}
-
-bool Objecter::ms_get_authorizer(int dest_type,
-				 AuthAuthorizer **authorizer)
-{
-  if (!initialized)
-    return false;
-  if (dest_type == CEPH_ENTITY_TYPE_MON)
-    return true;
-  *authorizer = monc->build_authorizer(dest_type);
-  return *authorizer != NULL;
 }
 
 void Objecter::op_target_t::dump(Formatter *f) const

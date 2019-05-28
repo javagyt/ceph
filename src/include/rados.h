@@ -124,6 +124,7 @@ struct ceph_eversion {
 #define CEPH_OSD_NODOWN       (1<<9)  /* osd can not be marked down */
 #define CEPH_OSD_NOIN         (1<<10) /* osd can not be marked in */
 #define CEPH_OSD_NOOUT        (1<<11) /* osd can not be marked out */
+#define CEPH_OSD_STOP         (1<<12) /* osd has been stopped by admin */
 
 extern const char *ceph_osd_state_name(int s);
 
@@ -193,11 +194,6 @@ extern const char *ceph_osd_state_name(int s);
 #define CEPH_RELEASE_NAUTILUS   14
 #define CEPH_RELEASE_OCTOPUS    15
 #define CEPH_RELEASE_MAX        16  /* highest + 1 */
-
-extern const char *ceph_release_name(int r);
-extern int ceph_release_from_name(const char *s);
-extern uint64_t ceph_release_features(int r);
-extern int ceph_release_from_features(uint64_t features);
 
 /*
  * The error code to return when an OSD can't handle a write

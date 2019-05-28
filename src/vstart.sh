@@ -145,6 +145,7 @@ fi
 
 filestore_path=
 kstore_path=
+bluestore_dev=
 
 VSTART_SEC="client.vstart.sh"
 
@@ -197,6 +198,7 @@ usage=$usage"\t--msgr2: use msgr2 only\n"
 usage=$usage"\t--msgr21: use msgr2 and msgr1\n"
 usage=$usage"\t--crimson: use crimson-osd instead of ceph-osd\n"
 usage=$usage"\t--osd-args: specify any extra osd specific options\n"
+usage=$usage"\t--bluestore-devs: comma-separated list of blockdevs to use for bluestore\n"
 
 usage_exit() {
 	printf "$usage"
@@ -378,6 +380,16 @@ case $1 in
         pci_id="$2"
         spdk_enabled=1
         shift
+	;;
+    --bluestore-devs )
+	IFS=',' read -r -a bluestore_dev <<< "$2"
+	for dev in "${bluestore_dev[@]}"; do
+	    if [ ! -b $dev -o ! -w $dev ]; then
+		    echo "All --bluestore-devs must refer to writable block devices"
+		    exit 1
+	    fi
+	done
+	shift
         ;;
     * )
 	    usage_exit
@@ -460,7 +472,7 @@ run() {
         if [ "$nodaemon" -eq 0 ]; then
             prun "$@"
         else
-            prunb ./ceph-run "$@" -f
+            prunb ${CEPH_ROOT}/src/ceph-run "$@" -f
         fi
     fi
 }
@@ -472,7 +484,12 @@ wconf() {
 }
 
 get_pci_selector() {
-    lspci -mm -n -D -d $pci_id | cut -d ' ' -f 1
+    which_pci=$1
+    lspci -mm -n -D -d $pci_id | cut -d ' ' -f 1 | sed -n $which_pci'p'
+}
+
+get_pci_selector_num() {
+    lspci -mm -n -D -d $pci_id | cut -d' ' -f 1 | wc -l
 }
 
 prepare_conf() {
@@ -563,8 +580,12 @@ EOF
 	fi
         if [ "$objectstore" == "bluestore" ]; then
             if [ "$spdk_enabled" -eq 1 ]; then
-                if [ "$(get_pci_selector)" == "" ]; then
-                    echo "Not find the specified NVME device, please check."
+                if [ "$(get_pci_selector_num)" -eq 0 ]; then
+                    echo "Not find the specified NVME device, please check." >&2
+                    exit
+                fi
+                if [ $(get_pci_selector_num) -lt $CEPH_NUM_OSD ]; then
+                    echo "OSD number ($CEPH_NUM_OSD) is greater than NVME SSD number ($(get_pci_selector_num)), please check." >&2
                     exit
                 fi
                 BLUESTORE_OPTS="        bluestore_block_db_path = \"\"
@@ -573,8 +594,7 @@ EOF
         bluestore_block_wal_path = \"\"
         bluestore_block_wal_size = 0
         bluestore_block_wal_create = false
-        bluestore_spdk_mem = 2048
-        bluestore_block_path = spdk:$(get_pci_selector)"
+        bluestore_spdk_mem = 2048"
             else
                 BLUESTORE_OPTS="        bluestore block db path = $CEPH_DEV_DIR/osd\$id/block.db.file
         bluestore block db size = 1073741824
@@ -741,11 +761,16 @@ EOF
 start_osd() {
     for osd in `seq 0 $(($CEPH_NUM_OSD-1))`
     do
-	    if [ "$new" -eq 1 ]; then
-		    wconf <<EOF
+	if [ "$new" -eq 1 ]; then
+            wconf <<EOF
 [osd.$osd]
         host = $HOSTNAME
 EOF
+            if [ "$spdk_enabled" -eq 1 ]; then
+                wconf <<EOF
+        bluestore_block_path = spdk:$(get_pci_selector $((osd+1)))
+EOF
+            fi
 
             rm -rf $CEPH_DEV_DIR/osd$osd || true
             if command -v btrfs > /dev/null; then
@@ -757,6 +782,13 @@ EOF
 		ln -s $kstore_path $CEPH_DEV_DIR/osd$osd
 	    else
 		mkdir -p $CEPH_DEV_DIR/osd$osd
+		if [ -n "${bluestore_dev[$osd]}" ]; then
+		    dd if=/dev/zero of=${bluestore_dev[$osd]} bs=1M count=1
+		    ln -s ${bluestore_dev[$osd]} $CEPH_DEV_DIR/osd$osd/block
+		    wconf <<EOF
+	bluestore fsck on mount = false
+EOF
+		fi
 	    fi
 
             local uuid=`uuidgen`
