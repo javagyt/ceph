@@ -38,6 +38,7 @@ overrides:
     - PG_DEGRADED
     - application not enabled
     - overall HEALTH_
+    - \(REQUEST_SLOW\)
     fs: xfs
     conf:
       mon:
